@@ -5,3 +5,4 @@ dist
 target
 *.egg-info
 *.log
+.DS_Store

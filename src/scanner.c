@@ -1,3 +1,4 @@
+#include "tree_sitter/alloc.h"
 #include "tree_sitter/parser.h"
 
 enum TokenType {
@@ -6,7 +7,10 @@ enum TokenType {
   FLOAT_LITERAL,
   BOZ_LITERAL,
   STRING_LITERAL,
-  END_OF_STATEMENT
+  STRING_LITERAL_KIND,
+  END_OF_STATEMENT,
+  PREPROC_UNARY_OPERATOR,
+  HOLLERITH_CONSTANT,
 };
 
 typedef struct {
@@ -37,13 +41,23 @@ static bool isxdigit(wchar_t c) {
 
 static bool iswdigit(wchar_t c) { return c >= L'0' && c <= L'9'; }
 
+static bool iswxdigit(wchar_t c) {
+  return (c >= L'0' && c <= L'9') || (c >= L'A' && c <= L'F') ||
+         (c >= L'a' && c <= L'f');
+}
+
+static bool iswalpha(wchar_t c) {
+  return (c >= L'A' && c <= L'Z') || (c >= L'a' && c <= L'z');
+}
+
 //  consume current character into current token and advance
 static inline void advance(TSLexer *lexer) { lexer->advance(lexer, false); }
 
 // ignore current character and advance
 static inline void skip(TSLexer *lexer) { lexer->advance(lexer, true); }
 
-static bool is_ident_char(char chr) { return iswalnum(chr) || chr == '_'; }
+// is `chr` ok for an identifier?
+static bool is_identifier_char(char chr) { return iswalnum(chr) || chr == '_'; }
 
 static bool is_boz_sentinel(char chr) {
   switch (chr) {
@@ -65,6 +79,8 @@ static bool is_exp_sentinel(char chr) {
   case 'd':
   case 'E':
   case 'e':
+  case 'Q':
+  case 'q':
     return true;
   default:
     return false;
@@ -79,23 +95,23 @@ static bool scan_int(TSLexer *lexer) {
   while (iswdigit(lexer->lookahead)) {
     advance(lexer); // store all digits
   }
+  lexer->mark_end(lexer);
 
   // handle line continuations
   if (lexer->lookahead == '&') {
-    skip(lexer);
+    advance(lexer);
     while (iswspace(lexer->lookahead)) {
-      skip(lexer);
+      advance(lexer);
     }
     // second '&' required to continue the literal
     if (lexer->lookahead == '&') {
-      skip(lexer);
+      advance(lexer);
       // don't return here, as we may have finished literal on first
       // line but still have second '&'
       scan_int(lexer);
     }
   }
 
-  lexer->mark_end(lexer);
   return true;
 }
 
@@ -123,23 +139,12 @@ static bool scan_number(TSLexer *lexer) {
       advance(lexer);
       if (lexer->lookahead == '+' || lexer->lookahead == '-') {
         advance(lexer);
+        lexer->mark_end(lexer);
       }
       if (!scan_int(lexer)) {
         return true; // valid number token with junk after it
       }
-      lexer->mark_end(lexer);
       lexer->result_symbol = FLOAT_LITERAL;
-    }
-    // get size qualifer
-    if (lexer->lookahead == '_') {
-      advance(lexer);
-      if (!isalnum(lexer->lookahead)) {
-        return true; // valid number token with junk after it
-      }
-      while (is_ident_char(lexer->lookahead)) {
-        advance(lexer); // store all digits
-      }
-      lexer->mark_end(lexer);
     }
   }
   return digits;
@@ -156,10 +161,10 @@ static bool scan_boz(TSLexer *lexer) {
   if (lexer->lookahead == '\'' || lexer->lookahead == '"') {
     quote = lexer->lookahead;
     advance(lexer);
-    if (!isxdigit(lexer->lookahead)) {
+    if (!iswxdigit(lexer->lookahead)) {
       return false;
     }
-    while (isxdigit(lexer->lookahead)) {
+    while (iswxdigit(lexer->lookahead)) {
       advance(lexer); // store all hex digits
     }
     if (lexer->lookahead != quote) {
@@ -175,6 +180,70 @@ static bool scan_boz(TSLexer *lexer) {
   return false;
 }
 
+// If in the middle of a literal, '&' is required in both lines
+static bool skip_literal_continuation_sequence(TSLexer *lexer) {
+  if (lexer->lookahead != '&') {
+    return true;
+  }
+
+  advance(lexer);
+  while (iswspace(lexer->lookahead)) {
+    advance(lexer);
+  }
+  // second '&' technically required to continue the literal
+  if (lexer->lookahead == '&') {
+    advance(lexer);
+    return true;
+  }
+  return false;
+}
+
+/// Need to dynamically determining the length of the Hollerith constant
+static bool scan_hollerith_constant(TSLexer *lexer) {
+  // Try to parse nH<text> where n is the number of characters in <text>
+
+  // Read integer prefix 'n'
+  unsigned length = 0;
+  while (iswdigit(lexer->lookahead)) {
+    unsigned new_length = length * 10 + (lexer->lookahead - '0');
+    // The number of characters has no limit but overflow has to be handled
+    if (new_length < length) {
+      return false;
+    }
+    length = new_length;
+    advance(lexer);
+
+    if (!skip_literal_continuation_sequence(lexer)) {
+      return false;
+    }
+  }
+
+  // 0 is invalid 'n' in Hollerith constants
+  if (length == 0) {
+    return false;
+  }
+
+  // Expect 'H' or 'h'
+  if (lexer->lookahead != 'H' && lexer->lookahead != 'h') {
+    return false;
+  }
+  advance(lexer);
+
+  // Read exactly 'n' characters
+  for (unsigned i = 0; i < length; i++) {
+    if (!lexer->lookahead || lexer->eof(lexer)) {
+      return false;
+    }
+    if (!skip_literal_continuation_sequence(lexer)) {
+      return false;
+    }
+    advance(lexer);
+  }
+  lexer->result_symbol = HOLLERITH_CONSTANT;
+  lexer->mark_end(lexer);
+  return true;
+}
+
 static bool scan_end_of_statement(Scanner *scanner, TSLexer *lexer) {
   // Things that end statements in Fortran:
   //
@@ -187,7 +256,7 @@ static bool scan_end_of_statement(Scanner *scanner, TSLexer *lexer) {
   // newline
 
   // Semicolons and EOF always end the statement
-  if (lexer->lookahead == ';' || lexer->eof(lexer)) {
+  if (lexer->eof(lexer)) {
     skip(lexer);
     lexer->result_symbol = END_OF_STATEMENT;
     return true;
@@ -251,6 +320,35 @@ static bool scan_end_line_continuation(Scanner *scanner, TSLexer *lexer) {
   return true;
 }
 
+static bool scan_string_literal_kind(TSLexer *lexer) {
+  // Strictly, it's allowed for the kind to be an integer literal, in
+  // practice I've not seen it
+  if (!iswalpha(lexer->lookahead)) {
+    return false;
+  }
+
+  lexer->result_symbol = STRING_LITERAL_KIND;
+
+  // We need two characters of lookahead to see `_"`
+  char current_char = '\0';
+
+  while (is_identifier_char(lexer->lookahead) && !lexer->eof(lexer)) {
+    current_char = lexer->lookahead;
+    // Don't capture the trailing underscore as part of the kind identifier
+    if (lexer->lookahead == '_') {
+      lexer->mark_end(lexer);
+    }
+    advance(lexer);
+  }
+
+  if ((current_char != '_') ||
+      (lexer->lookahead != '"' && lexer->lookahead != '\'')) {
+    return false;
+  }
+
+  return true;
+}
+
 static bool scan_string_literal(TSLexer *lexer) {
   const char opening_quote = lexer->lookahead;
 
@@ -297,8 +395,12 @@ static bool scan_string_literal(TSLexer *lexer) {
     // both of them
     if (lexer->lookahead == opening_quote) {
       advance(lexer);
-      // It was just one quote, so we've successfully reached the
-      // end of the literal
+      // It was just one quote, so we've successfully reached
+      // the end of the literal. We also need to check that an
+      // escaped quote isn't split in half by a line
+      // continuation -- people do this!
+      lexer->mark_end(lexer);
+      skip_literal_continuation_sequence(lexer);
       if (lexer->lookahead != opening_quote) {
         return true;
       }
@@ -308,6 +410,18 @@ static bool scan_string_literal(TSLexer *lexer) {
 
   // We hit the end of the line without an '&', so this is an
   // unclosed string literal (an error)
+  return false;
+}
+
+/// Need an external scanner to catch '!' before its parsed as a comment
+static bool scan_preproc_unary_operator(TSLexer *lexer) {
+  const char next_char = lexer->lookahead;
+  if (next_char == '!' || next_char == '~' || next_char == '-' ||
+      next_char == '+') {
+    advance(lexer);
+    lexer->result_symbol = PREPROC_UNARY_OPERATOR;
+    return true;
+  }
   return false;
 }
 
@@ -341,6 +455,12 @@ static bool scan(Scanner *scanner, TSLexer *lexer, const bool *valid_symbols) {
     }
   }
 
+  if (valid_symbols[HOLLERITH_CONSTANT]) {
+    if (scan_hollerith_constant(lexer)) {
+      return true;
+    }
+  }
+
   if (valid_symbols[INTEGER_LITERAL] || valid_symbols[FLOAT_LITERAL] ||
       valid_symbols[BOZ_LITERAL]) {
     // extract out root number from expression
@@ -352,15 +472,29 @@ static bool scan(Scanner *scanner, TSLexer *lexer, const bool *valid_symbols) {
     }
   }
 
+  if (valid_symbols[PREPROC_UNARY_OPERATOR]) {
+    if (scan_preproc_unary_operator(lexer)) {
+      return true;
+    }
+  }
+
   if (scan_start_line_continuation(scanner, lexer)) {
     return true;
+  }
+
+  if (valid_symbols[STRING_LITERAL_KIND]) {
+    // This may need a lot of lookahead, so should (probably) always
+    // be the last token to look for
+    if (scan_string_literal_kind(lexer)) {
+      return true;
+    }
   }
 
   return false;
 }
 
 void *tree_sitter_fortran_external_scanner_create() {
-  return calloc(1, sizeof(bool));
+  return ts_calloc(1, sizeof(bool));
 }
 
 bool tree_sitter_fortran_external_scanner_scan(void *payload, TSLexer *lexer,
@@ -387,5 +521,5 @@ void tree_sitter_fortran_external_scanner_deserialize(void *payload,
 
 void tree_sitter_fortran_external_scanner_destroy(void *payload) {
   Scanner *scanner = (Scanner *)payload;
-  free(scanner);
+  ts_free(scanner);
 }
